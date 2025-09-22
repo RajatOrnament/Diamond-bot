@@ -1,70 +1,90 @@
+// index.js — Full Flow Webhook with WhatsApp Encryption Support
+
 const express = require("express");
-const axios = require("axios");
 const bodyParser = require("body-parser");
+const axios = require("axios");
+const fs = require("fs");
+const crypto = require("crypto");
 
 const app = express();
-app.use(bodyParser.json());
+app.use(bodyParser.json({ limit: "5mb" }));
 
-// 🔐 Replace with your actual secrets
+// Load RSA private key
+const PRIVATE_KEY = fs.readFileSync("keys/private.key", "utf8");
+
+// Env vars (set these in Render)
 const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
 const WHATSAPP_API_URL = process.env.WHATSAPP_API_URL;
 const GOOGLE_SCRIPT_URL = process.env.GOOGLE_SCRIPT_URL;
 
-// ✅ Health Check Endpoint for Meta
+// Health Check
 app.get("/webhook/health-check", (req, res) => {
   res.status(200).json({ status: "ok" });
 });
 
-// 🟢 Main Webhook Handler
+// Decrypt AES key using RSA
+function decryptAESKey(encryptedKey) {
+  return crypto.privateDecrypt(
+    {
+      key: PRIVATE_KEY,
+      padding: crypto.constants.RSA_PKCS1_OAEP_PADDING
+    },
+    Buffer.from(encryptedKey, "base64")
+  );
+}
+
+// Decrypt Flow payload
+function decryptPayload(encryptedData, aesKey, iv) {
+  const decipher = crypto.createDecipheriv(
+    "aes-256-gcm",
+    aesKey,
+    Buffer.from(iv, "base64")
+  );
+  decipher.setAuthTag(Buffer.alloc(16)); // Optional, based on encryption setup
+
+  let decrypted = decipher.update(Buffer.from(encryptedData, "base64"), null, "utf8");
+  decrypted += decipher.final("utf8");
+  return JSON.parse(decrypted);
+}
+
 app.post("/webhook", async (req, res) => {
   try {
-    const data = req.body;
-    const from = data.from || data.contacts?.[0]?.wa_id;
+    const { encrypted_flow_data, encrypted_aes_key, initial_vector } = req.body;
 
-    // ✅ Handle "start over"
-    if (data.message?.toLowerCase?.().includes("start over")) {
-      await sendText(from, "🔁 Restarting your diamond search. Please start again.");
-      return res.sendStatus(200);
+    if (!encrypted_flow_data || !encrypted_aes_key || !initial_vector) {
+      return res.status(400).send("Missing encrypted fields");
     }
 
-    // ✅ Handle "Add to Cart"
-    if (data.button?.payload?.startsWith("add_to_cart::")) {
-      const stoneId = data.button.payload.split("::")[1];
-      await sendText(from, `✅ Diamond ${stoneId} added to your cart!`);
-      return res.sendStatus(200);
+    const aesKey = decryptAESKey(encrypted_aes_key);
+    const decryptedPayload = decryptPayload(encrypted_flow_data, aesKey, initial_vector);
+
+    // Handle Meta health-check
+    if (decryptedPayload.action === "ping") {
+      return res.status(200).json({ status: "active" });
     }
 
-    // ✅ Handle Flow submission (filter payload)
-    const filters = {
-      shape: data.shape,
-      min_carat: data.min_carat,
-      max_carat: data.max_carat,
-      color: data.color,
-      clarity: data.clarity
-    };
+    const { shape, min_carat, max_carat, color, clarity, from } = decryptedPayload;
 
-    console.log("Incoming filters:", filters);
-
+    const filters = { shape, min_carat, max_carat, color, clarity };
     const response = await axios.post(GOOGLE_SCRIPT_URL, filters);
     const diamonds = response.data.diamonds;
 
     if (!diamonds || diamonds.length === 0) {
-      await sendText(from, "❌ No matching diamonds found for your selection.");
+      await sendText(from, "❌ No matching diamonds found.");
     } else {
       for (const d of diamonds) {
         await sendDiamondCard(from, d);
       }
-      await sendText(from, "✨ That’s our top 10 picks.\nType *start over* to search again.");
+      await sendText(from, "✨ That’s our top 10. Type *start over* to search again.");
     }
 
     res.sendStatus(200);
   } catch (err) {
-    console.error("❌ Webhook error:", err.message);
+    console.error("❌ Webhook decryption error:", err);
     res.status(500).send("Something went wrong.");
   }
 });
 
-// ✅ Send text message
 async function sendText(to, message) {
   return axios.post(
     WHATSAPP_API_URL,
@@ -83,7 +103,6 @@ async function sendText(to, message) {
   );
 }
 
-// ✅ Send image + button card
 async function sendDiamondCard(to, d) {
   return axios.post(
     WHATSAPP_API_URL,
@@ -95,12 +114,10 @@ async function sendDiamondCard(to, d) {
         type: "button",
         header: {
           type: "image",
-          image: {
-            link: d.image_url || "https://yourdomain.com/placeholder.jpg"
-          }
+          image: { link: d.image_url }
         },
         body: {
-          text: `💎 *${d.title}*\n${d.subtitle}\n📄 [View Certificate](${d.certificate_url})`
+          text: `💎 *${d.title}*\n${d.subtitle}\n📄 Certificate: ${d.certificate_url}`
         },
         action: {
           buttons: [
@@ -126,5 +143,5 @@ async function sendDiamondCard(to, d) {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`🚀 Webhook server running on port ${PORT}`);
+  console.log(`✅ Flow webhook listening on port ${PORT}`);
 });
