@@ -1,4 +1,4 @@
-// index.js — With Encrypted Private Key Support (with password)
+// index.js — Final Version with Decryption using Plain (Unprotected) RSA Key
 
 const express = require("express");
 const bodyParser = require("body-parser");
@@ -9,11 +9,8 @@ const crypto = require("crypto");
 const app = express();
 app.use(bodyParser.json({ limit: "5mb" }));
 
-// Load password-protected RSA private key
-const PRIVATE_KEY = {
-  key: fs.readFileSync("keys/private.key", "utf8"),
-  passphrase: "Sumish@12"
-};
+// Load unencrypted RSA private key
+const PRIVATE_KEY = fs.readFileSync("keys/private_plain.key", "utf8");
 
 // Env vars (set these in Render)
 const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
@@ -29,8 +26,7 @@ app.get("/webhook/health-check", (req, res) => {
 function decryptAESKey(encryptedKey) {
   return crypto.privateDecrypt(
     {
-      key: PRIVATE_KEY.key,
-      passphrase: PRIVATE_KEY.passphrase,
+      key: PRIVATE_KEY,
       padding: crypto.constants.RSA_PKCS1_OAEP_PADDING
     },
     Buffer.from(encryptedKey, "base64")
