@@ -1,4 +1,4 @@
-// index.js — Full Flow Webhook with WhatsApp Encryption Support
+// index.js — With Encrypted Private Key Support (with password)
 
 const express = require("express");
 const bodyParser = require("body-parser");
@@ -9,8 +9,11 @@ const crypto = require("crypto");
 const app = express();
 app.use(bodyParser.json({ limit: "5mb" }));
 
-// Load RSA private key
-const PRIVATE_KEY = fs.readFileSync("keys/private.key.txt", "utf8");
+// Load password-protected RSA private key
+const PRIVATE_KEY = {
+  key: fs.readFileSync("keys/private.key", "utf8"),
+  passphrase: "Sumish@12"
+};
 
 // Env vars (set these in Render)
 const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
@@ -26,7 +29,8 @@ app.get("/webhook/health-check", (req, res) => {
 function decryptAESKey(encryptedKey) {
   return crypto.privateDecrypt(
     {
-      key: PRIVATE_KEY,
+      key: PRIVATE_KEY.key,
+      passphrase: PRIVATE_KEY.passphrase,
       padding: crypto.constants.RSA_PKCS1_OAEP_PADDING
     },
     Buffer.from(encryptedKey, "base64")
@@ -40,7 +44,7 @@ function decryptPayload(encryptedData, aesKey, iv) {
     aesKey,
     Buffer.from(iv, "base64")
   );
-  decipher.setAuthTag(Buffer.alloc(16)); // Optional, based on encryption setup
+  decipher.setAuthTag(Buffer.alloc(16));
 
   let decrypted = decipher.update(Buffer.from(encryptedData, "base64"), null, "utf8");
   decrypted += decipher.final("utf8");
@@ -58,13 +62,11 @@ app.post("/webhook", async (req, res) => {
     const aesKey = decryptAESKey(encrypted_aes_key);
     const decryptedPayload = decryptPayload(encrypted_flow_data, aesKey, initial_vector);
 
-    // Handle Meta health-check
     if (decryptedPayload.action === "ping") {
       return res.status(200).json({ status: "active" });
     }
 
     const { shape, min_carat, max_carat, color, clarity, from } = decryptedPayload;
-
     const filters = { shape, min_carat, max_carat, color, clarity };
     const response = await axios.post(GOOGLE_SCRIPT_URL, filters);
     const diamonds = response.data.diamonds;
