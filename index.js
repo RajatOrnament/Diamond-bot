@@ -10,7 +10,7 @@ const app = express();
 app.use(bodyParser.json({ limit: "5mb" }));
 
 // Load RSA private key
-const PRIVATE_KEY = fs.readFileSync("keys/private.key", "utf8");
+const PRIVATE_KEY = fs.readFileSync("keys/private.key.txt", "utf8");
 
 // Env vars (set these in Render)
 const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
