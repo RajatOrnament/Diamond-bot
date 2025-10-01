@@ -6,4 +6,5 @@ node_modules/
 .DS_Store
 npm-debug.log
 
-keys/private.key
+keys/private_plain.key
+
