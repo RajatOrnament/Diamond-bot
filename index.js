@@ -1,5 +1,5 @@
 // server.js
-// WhatsApp Flows webhook with RSA-OAEP(SHA-256) + AES-GCM decryption
+// WhatsApp Flows webhook: robust field extraction + RSA-OAEP(SHA-256) & AES-GCM
 
 const express = require("express");
 const bodyParser = require("body-parser");
@@ -10,50 +10,104 @@ const crypto = require("crypto");
 const app = express();
 app.use(bodyParser.json({ limit: "5mb" }));
 
-/* -------------------------- Env & Key Setup -------------------------- */
+/* --------------------------- ENV & KEY SETUP --------------------------- */
 
 const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
 const WHATSAPP_API_URL = process.env.WHATSAPP_API_URL;
 const GOOGLE_SCRIPT_URL = process.env.GOOGLE_SCRIPT_URL;
+const VERIFY_TOKEN = process.env.VERIFY_TOKEN || ""; // optional: GET verify support
 
 if (!WHATSAPP_TOKEN || !WHATSAPP_API_URL || !GOOGLE_SCRIPT_URL) {
   console.warn(
-    "[WARN] Missing one or more env vars: WHATSAPP_TOKEN, WHATSAPP_API_URL, GOOGLE_SCRIPT_URL"
+    "[WARN] Missing env var(s): WHATSAPP_TOKEN, WHATSAPP_API_URL, GOOGLE_SCRIPT_URL"
   );
 }
 
-// Load the private key and create a KeyObject (safer + lets us inspect details)
 const PRIVATE_KEY_PEM = fs.readFileSync("keys/private_plain.key", "utf8");
 const PRIVATE_KEY = crypto.createPrivateKey(PRIVATE_KEY_PEM);
 
-/* -------------------------- Small Utilities -------------------------- */
+/* ------------------------------ HELPERS -------------------------------- */
 
-// Convert base64url → Buffer (Meta commonly uses base64url)
+// base64url → Buffer (also accepts plain base64)
 function b64urlToBuf(s) {
-  if (typeof s !== "string" || !s.length) return Buffer.alloc(0);
-  const pad = "=".repeat((4 - (s.length % 4)) % 4);
-  const b64 = (s + pad).replace(/-/g, "+").replace(/_/g, "/");
-  return Buffer.from(b64, "base64");
+  if (typeof s !== "string" || s.length === 0) return Buffer.alloc(0);
+  const hasUrlChars = s.includes("-") || s.includes("_");
+  const base = hasUrlChars ? s.replace(/-/g, "+").replace(/_/g, "/") : s;
+  const pad = "=".repeat((4 - (base.length % 4)) % 4);
+  return Buffer.from(base + pad, "base64");
 }
 
-// Coalesce possible field names for the GCM tag in the incoming body
-function getAuthTagFromBody(body) {
-  return (
-    body.authentication_tag ||
-    body.auth_tag ||
-    body.tag ||
-    body.gcm_tag ||
-    null
-  );
+// Shallow list of keys for safe diagnostics
+function topKeys(obj) {
+  try {
+    return Object.keys(obj || {});
+  } catch {
+    return [];
+  }
 }
 
-/* ---------------------------- Cryptography --------------------------- */
+// BFS search for a property name (exact) anywhere in the object tree
+function deepFindFirst(obj, propName, maxDepth = 8) {
+  if (!obj || typeof obj !== "object") return undefined;
+  const q = [{ v: obj, d: 0 }];
+  while (q.length) {
+    const { v, d } = q.shift();
+    if (d > maxDepth) continue;
+    if (Object.prototype.hasOwnProperty.call(v, propName)) {
+      return v[propName];
+    }
+    if (Array.isArray(v)) {
+      for (const it of v) if (it && typeof it === "object") q.push({ v: it, d: d + 1 });
+    } else {
+      for (const k of Object.keys(v)) {
+        const child = v[k];
+        if (child && typeof child === "object") q.push({ v: child, d: d + 1 });
+      }
+    }
+  }
+  return undefined;
+}
 
-// Decrypt the AES key using RSA-OAEP (SHA-256)
+// Coalesce likely names for each field (handles top-level & nested)
+function extractEncryptedFields(body) {
+  const encrypted_flow_data =
+    body.encrypted_flow_data ??
+    body.encrypted_data ??
+    deepFindFirst(body, "encrypted_flow_data") ??
+    deepFindFirst(body, "encrypted_data");
+
+  const encrypted_aes_key =
+    body.encrypted_aes_key ??
+    body.encrypted_key ??
+    deepFindFirst(body, "encrypted_aes_key") ??
+    deepFindFirst(body, "encrypted_key");
+
+  const initial_vector =
+    body.initial_vector ??
+    body.iv ??
+    body.initialisation_vector ??
+    deepFindFirst(body, "initial_vector") ??
+    deepFindFirst(body, "iv") ??
+    deepFindFirst(body, "initialisation_vector");
+
+  const authentication_tag =
+    body.authentication_tag ??
+    body.auth_tag ??
+    body.tag ??
+    body.gcm_tag ??
+    deepFindFirst(body, "authentication_tag") ??
+    deepFindFirst(body, "auth_tag") ??
+    deepFindFirst(body, "tag") ??
+    deepFindFirst(body, "gcm_tag");
+
+  return { encrypted_flow_data, encrypted_aes_key, initial_vector, authentication_tag };
+}
+
+/* ----------------------------- CRYPTO ---------------------------------- */
+
 function decryptAESKey(encryptedKeyB64url) {
   const encKey = b64urlToBuf(encryptedKeyB64url);
 
-  // Optional sanity check: ciphertext length must equal modulus size (bytes)
   const keyBytes = PRIVATE_KEY.asymmetricKeyDetails
     ? PRIVATE_KEY.asymmetricKeyDetails.modulusLength / 8
     : null;
@@ -61,7 +115,7 @@ function decryptAESKey(encryptedKeyB64url) {
   if (keyBytes && encKey.length !== keyBytes) {
     throw new Error(
       `Encrypted AES key length (${encKey.length}) != RSA modulus bytes (${keyBytes}). ` +
-        `This usually means the private key does not match the public key registered with WhatsApp.`
+        `Likely a key mismatch with the public key registered on WhatsApp.`
     );
   }
 
@@ -75,13 +129,11 @@ function decryptAESKey(encryptedKeyB64url) {
   );
 }
 
-// Decrypt the payload using AES-GCM
 function decryptPayload({ encrypted_flow_data, initial_vector, authentication_tag }, aesKey) {
-  const iv = b64urlToBuf(initial_vector);            // typically 12 bytes
-  const ct = b64urlToBuf(encrypted_flow_data);       // ciphertext bytes
-  const tag = b64urlToBuf(authentication_tag);       // 16 bytes
+  const iv = b64urlToBuf(initial_vector);       // usually 12 bytes
+  const ct = b64urlToBuf(encrypted_flow_data);
+  const tag = b64urlToBuf(authentication_tag);  // 16 bytes
 
-  // Pick AES variant by key length
   const alg =
     aesKey.length === 32 ? "aes-256-gcm" :
     aesKey.length === 24 ? "aes-192-gcm" :
@@ -95,7 +147,18 @@ function decryptPayload({ encrypted_flow_data, initial_vector, authentication_ta
   return JSON.parse(out.toString("utf8"));
 }
 
-/* ------------------------------ Routes ------------------------------ */
+/* ------------------------------ ROUTES --------------------------------- */
+
+// Optional: basic verification for standard WA callbacks
+app.get("/webhook", (req, res) => {
+  const mode = req.query["hub.mode"];
+  const token = req.query["hub.verify_token"];
+  const challenge = req.query["hub.challenge"];
+  if (mode === "subscribe" && token && VERIFY_TOKEN && token === VERIFY_TOKEN) {
+    return res.status(200).send(challenge);
+  }
+  return res.status(403).send("Forbidden");
+});
 
 // Health check
 app.get("/webhook/health-check", (_req, res) => {
@@ -105,50 +168,44 @@ app.get("/webhook/health-check", (_req, res) => {
 // Main webhook
 app.post("/webhook", async (req, res) => {
   try {
-    // Expect base64url strings for these fields (naming per Meta Flows)
-    const {
-      encrypted_flow_data,
-      encrypted_aes_key,
-      initial_vector,
-    } = req.body;
+    // 1) If the builder sends a plain heartbeat like { action: "ping" } (no encryption)
+    if (req.body && req.body.action === "ping") {
+      return res.status(200).json({ status: "active" });
+    }
 
-    const authentication_tag = getAuthTagFromBody(req.body);
+    // 2) Try to pull encrypted fields from any reasonable shape
+    const fields = extractEncryptedFields(req.body);
+    const { encrypted_flow_data, encrypted_aes_key, initial_vector, authentication_tag } = fields;
 
+    // 2a) If still not present but this looks like a normal WA envelope, ack and ignore
     if (!encrypted_flow_data || !encrypted_aes_key || !initial_vector || !authentication_tag) {
+      // If it's a standard WABA message/status envelope, just 200 OK so Meta doesn't retry
+      if (req.body && (req.body.entry || req.body.object || req.body.field)) {
+        if (process.env.LOG_SIZES === "1") {
+          console.log("[Ignored non-Flow webhook] top-level keys:", topKeys(req.body));
+        }
+        return res.sendStatus(200);
+      }
+
+      // For anything else, provide a clear 400 with safe diagnostics
       return res
         .status(400)
-        .send(
-          "Missing encrypted fields. Need: encrypted_flow_data, encrypted_aes_key, initial_vector, authentication_tag"
-        );
+        .json({
+          error: "Missing encrypted fields",
+          need: ["encrypted_flow_data", "encrypted_aes_key", "initial_vector", "authentication_tag"],
+          got_top_level_keys: topKeys(req.body),
+        });
     }
 
-    // (Optional) quick diagnostics, no secrets
-    if (process.env.LOG_SIZES === "1") {
-      const keyBytes = PRIVATE_KEY.asymmetricKeyDetails
-        ? PRIVATE_KEY.asymmetricKeyDetails.modulusLength / 8
-        : null;
-      console.log({
-        encKeyLen: b64urlToBuf(encrypted_aes_key).length,
-        rsaBytes: keyBytes,
-        ivLen: b64urlToBuf(initial_vector).length,
-        tagLen: b64urlToBuf(authentication_tag).length,
-        ctLen: b64urlToBuf(encrypted_flow_data).length,
-      });
-    }
-
-    // Decrypt
+    // 3) Decrypt
     const aesKey = decryptAESKey(encrypted_aes_key);
-    const payload = decryptPayload(
-      { encrypted_flow_data, initial_vector, authentication_tag },
-      aesKey
-    );
+    const payload = decryptPayload({ encrypted_flow_data, initial_vector, authentication_tag }, aesKey);
 
-    // Handle ping (keep-alive) signal
+    // 4) Business logic
     if (payload.action === "ping") {
       return res.status(200).json({ status: "active" });
     }
 
-    // Your business logic
     const { shape, min_carat, max_carat, color, clarity, from } = payload;
 
     const filters = { shape, min_carat, max_carat, color, clarity };
@@ -161,26 +218,22 @@ app.post("/webhook", async (req, res) => {
       for (const d of diamonds) {
         await sendDiamondCard(from, d);
       }
-      await sendText(
-        from,
-        "✨ That’s our top 10. Type *start over* to search again."
-      );
+      await sendText(from, "✨ That’s our top 10. Type *start over* to search again.");
     }
 
-    res.sendStatus(200);
+    return res.sendStatus(200);
   } catch (err) {
-    // Safe structured log (no secrets)
     console.error("Webhook error:", {
       name: err.name,
       message: err.message,
       code: err.code,
       openssl: err.opensslErrorStack,
     });
-    res.status(500).send("Something went wrong.");
+    return res.status(500).send("Something went wrong.");
   }
 });
 
-/* ------------------------ WhatsApp Send Helpers ---------------------- */
+/* ------------------------ WHATSAPP SEND HELPERS ------------------------ */
 
 async function sendText(to, message) {
   return axios.post(
@@ -238,7 +291,7 @@ async function sendDiamondCard(to, d) {
   );
 }
 
-/* ------------------------------ Server ------------------------------ */
+/* -------------------------------- SERVER -------------------------------- */
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
